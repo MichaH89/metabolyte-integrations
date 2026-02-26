@@ -424,7 +424,10 @@ app.get("/webhooks/strava/test", async (req, res) => {
 
 async function fetchAndStoreActivity(athleteId, activityId) {
   const conn = await getConnectionByAthleteId(athleteId);
-  if (!conn) throw new Error(`No connection for athlete_id=${athleteId}`);
+ if (!conn) {
+  console.warn(`Webhook for athlete_id=${athleteId} but no OAuth connection yet.`);
+  return;
+}
 
   const accessToken = await refreshTokenIfNeeded(conn);
 
