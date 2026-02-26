@@ -524,3 +524,9 @@ app.listen(port, async () => {
   console.log("Health:", `${PUBLIC_BASE_URL}/health`);
   console.log("Strava OAuth start example:", `${PUBLIC_BASE_URL}/auth/strava/start?email=test@example.com`);
 });
+app.get("/debug/connections", async (req, res) => {
+  const r = await pool.query(
+    "select user_email, athlete_id, expires_at, scope, updated_at from strava_connections order by updated_at desc limit 20"
+  );
+  res.json(r.rows);
+});
