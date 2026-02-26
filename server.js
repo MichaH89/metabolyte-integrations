@@ -4,21 +4,25 @@ import crypto from "crypto";
 const app = express();
 app.use(express.json());
 
-// Super-simple token storage (NUR fürs Testen!)
-// Nach einem Render-Restart ist das weg.
+// =====================================================
+// SUPER SIMPLE TOKEN STORAGE (nur für Test!)
+// =====================================================
 let stravaTokens = null;
 
-// 1) Health check
+// =====================================================
+// HEALTH CHECK
+// =====================================================
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-// Helper: env safe read
+// =====================================================
+// HELPER
+// =====================================================
 function mustGetEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
 }
 
-// Helper: valid access token (mit Refresh wenn abgelaufen)
 async function getValidAccessToken() {
   if (!stravaTokens) {
     throw new Error("Not connected to Strava. Open /auth/strava/start first.");
@@ -31,7 +35,7 @@ async function getValidAccessToken() {
     return stravaTokens.access_token;
   }
 
-  // Refresh
+  // Refresh Token
   const clientId = mustGetEnv("STRAVA_CLIENT_ID");
   const clientSecret = mustGetEnv("STRAVA_CLIENT_SECRET");
 
@@ -53,19 +57,19 @@ async function getValidAccessToken() {
     throw new Error("Refresh token failed");
   }
 
-  stravaTokens = refreshJson; // neue Tokens speichern
+  stravaTokens = refreshJson;
   return stravaTokens.access_token;
 }
 
-// 2) Start OAuth: Redirect zu Strava
+// =====================================================
+// STRAVA OAUTH START
+// =====================================================
 app.get("/auth/strava/start", (req, res) => {
   const clientId = mustGetEnv("STRAVA_CLIENT_ID");
   const redirectUri = mustGetEnv("STRAVA_REDIRECT_URI");
 
-  // State = Schutz gegen Fake-Callbacks
   const state = crypto.randomBytes(16).toString("hex");
-
-  const scope = "read,activity:read_all"; // Scopes kommen HIER rein
+  const scope = "read,activity:read_all";
 
   const url =
     "https://www.strava.com/oauth/authorize" +
@@ -79,14 +83,26 @@ app.get("/auth/strava/start", (req, res) => {
   return res.redirect(url);
 });
 
-// 3) Callback: code -> token exchange
+// =====================================================
+// STRAVA CALLBACK
+// =====================================================
 app.get("/auth/strava/callback", async (req, res) => {
   try {
+    if (req.query.error) {
+      return res.status(400).json({
+        error: "Strava returned an error",
+        details: req.query
+      });
+    }
+
     const code = req.query.code;
     const scope = req.query.scope;
 
     if (!code) {
-      return res.status(400).send("Missing ?code from Strava");
+      return res.status(400).json({
+        error: "Missing code",
+        details: req.query
+      });
     }
 
     const clientId = mustGetEnv("STRAVA_CLIENT_ID");
@@ -110,10 +126,8 @@ app.get("/auth/strava/callback", async (req, res) => {
       return res.status(500).json({ error: "Token exchange failed", details: tokenJson });
     }
 
-    // Tokens merken (Testmodus)
     stravaTokens = tokenJson;
 
-    // Simple "OK" Seite mit Link
     return res.send(`
       <h2>Strava verbunden ✅</h2>
       <p>Athlete ID: ${tokenJson.athlete?.id}</p>
@@ -126,7 +140,9 @@ app.get("/auth/strava/callback", async (req, res) => {
   }
 });
 
-// 4) Letzte Aktivitäten anzeigen (Top 10)
+// =====================================================
+// LETZTE AKTIVITÄTEN
+// =====================================================
 app.get("/strava/activities", async (req, res) => {
   try {
     const accessToken = await getValidAccessToken();
@@ -139,16 +155,19 @@ app.get("/strava/activities", async (req, res) => {
     const data = await r.json();
 
     if (!r.ok) {
-      console.error("Strava activities error:", data);
       return res.status(500).json({ error: "Strava API error", details: data });
     }
 
-    const items = data
-      .map((a) => {
-        const km = a.distance ? (a.distance / 1000).toFixed(2) : "0.00";
-        return `<li><b>${a.type}</b> — ${a.name} — ${km} km — <a href="/strava/activity/${a.id}">Details</a></li>`;
-      })
-      .join("");
+    const items = data.map(a => {
+      const km = a.distance ? (a.distance / 1000).toFixed(2) : "0.00";
+      return `
+        <li>
+          <b>${a.type}</b> — ${a.name} — ${km} km —
+          <a href="/strava/activity/${a.id}">Details</a> |
+          <a href="/strava/activity/${a.id}/streams">Streams</a>
+        </li>
+      `;
+    }).join("");
 
     return res.send(`<h2>Letzte Aktivitäten</h2><ul>${items}</ul>`);
   } catch (e) {
@@ -156,20 +175,22 @@ app.get("/strava/activities", async (req, res) => {
   }
 });
 
-// 5) Activity Details (einzelne Aktivität)
+// =====================================================
+// ACTIVITY DETAILS
+// =====================================================
 app.get("/strava/activity/:id", async (req, res) => {
   try {
     const accessToken = await getValidAccessToken();
     const id = req.params.id;
 
-    const r = await fetch(`https://www.strava.com/api/v3/activities/${id}`, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
+    const r = await fetch(
+      `https://www.strava.com/api/v3/activities/${id}`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
 
     const data = await r.json();
 
     if (!r.ok) {
-      console.error("Strava activity detail error:", data);
       return res.status(500).json({ error: "Strava API error", details: data });
     }
 
@@ -179,17 +200,14 @@ app.get("/strava/activity/:id", async (req, res) => {
   }
 });
 
-// Render gibt PORT vor
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("Server running on port", port));
-
-// 6) Activity Streams (Zeitreihen) = quasi FIT-Inhalt (HR, Pace, Power etc.)
+// =====================================================
+// ACTIVITY STREAMS (Pseudo-FIT Daten)
+// =====================================================
 app.get("/strava/activity/:id/streams", async (req, res) => {
   try {
     const accessToken = await getValidAccessToken();
     const id = req.params.id;
 
-    // Welche Streams du willst:
     const keys = [
       "time",
       "distance",
@@ -203,32 +221,31 @@ app.get("/strava/activity/:id/streams", async (req, res) => {
     ].join(",");
 
     const r = await fetch(
-      `https://www.strava.com/api/v3/activities/${id}/streams?keys=${encodeURIComponent(
-        keys
-      )}&key_by_type=true`,
-      {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      }
+      `https://www.strava.com/api/v3/activities/${id}/streams?keys=${encodeURIComponent(keys)}&key_by_type=true`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
     );
 
     const data = await r.json();
 
     if (!r.ok) {
-      console.error("Strava streams error:", data);
       return res.status(500).json({ error: "Strava API error", details: data });
     }
 
-    // Nur ein kleiner Überblick (damit dein Browser nicht explodiert)
     const summary = Object.keys(data).reduce((acc, k) => {
       acc[k] = {
-        hasData: Array.isArray(data[k]?.data),
         points: Array.isArray(data[k]?.data) ? data[k].data.length : 0
       };
       return acc;
     }, {});
 
-    return res.json({ summary, streams: data });
+    return res.json({ summary });
   } catch (e) {
     return res.status(500).send(String(e?.message ?? e));
   }
 });
+
+// =====================================================
+// SERVER START
+// =====================================================
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log("Server running on port", port));
