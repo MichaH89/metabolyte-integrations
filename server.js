@@ -4,11 +4,13 @@ import cookieParser from "cookie-parser";
 import { Pool } from "pg";
 
 const app = express();
+
+// Strava Webhooks schicken JSON – wir akzeptieren alles
 app.use(express.json({ type: "*/*" }));
 app.use(cookieParser());
 
 // ---------- ENV ----------
-function mustGetEnv(name: string): string {
+function mustGetEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
@@ -20,11 +22,15 @@ const STRAVA_REDIRECT_URI = mustGetEnv("STRAVA_REDIRECT_URI");
 const STRAVA_WEBHOOK_VERIFY_TOKEN = mustGetEnv("STRAVA_WEBHOOK_VERIFY_TOKEN");
 const PUBLIC_BASE_URL = mustGetEnv("PUBLIC_BASE_URL");
 const BASE44_INGEST_SECRET = mustGetEnv("BASE44_INGEST_SECRET");
+const BASE44_INGEST_URL = mustGetEnv("BASE44_INGEST_URL");
 
 // ---------- DB ----------
 const pool = new Pool({
   connectionString: mustGetEnv("DATABASE_URL"),
-  ssl: process.env.DATABASE_URL?.includes("render.com") ? { rejectUnauthorized: false } : undefined,
+  // Render Postgres braucht oft SSL, lokal meistens nicht
+  ssl: process.env.DATABASE_URL?.includes("render.com")
+    ? { rejectUnauthorized: false }
+    : undefined,
 });
 
 // Create tables if not exist (super simple migration)
@@ -80,11 +86,11 @@ async function dbNow() {
 }
 
 // ---------- HELPERS ----------
-function randomState(): string {
+function randomState() {
   return crypto.randomBytes(16).toString("hex");
 }
 
-async function saveOAuthState(state: string, userEmail: string) {
+async function saveOAuthState(state, userEmail) {
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
   await pool.query(
     `insert into oauth_state(state, user_email, provider, expires_at)
@@ -93,9 +99,10 @@ async function saveOAuthState(state: string, userEmail: string) {
   );
 }
 
-async function consumeOAuthState(state: string): Promise<{ user_email: string } | null> {
+async function consumeOAuthState(state) {
   const r = await pool.query(
-    `select user_email from oauth_state where state=$1 and provider='strava' and expires_at > now()`,
+    `select user_email from oauth_state
+     where state=$1 and provider='strava' and expires_at > now()`,
     [state]
   );
   if (r.rowCount === 0) return null;
@@ -103,14 +110,7 @@ async function consumeOAuthState(state: string): Promise<{ user_email: string } 
   return { user_email: r.rows[0].user_email };
 }
 
-async function upsertConnection(params: {
-  user_email: string;
-  athlete_id: number;
-  access_token: string;
-  refresh_token: string;
-  expires_at: number;
-  scope?: string;
-}) {
+async function upsertConnection(params) {
   await pool.query(
     `
     insert into strava_connections(user_email, athlete_id, access_token, refresh_token, expires_at, scope)
@@ -123,19 +123,25 @@ async function upsertConnection(params: {
       scope=excluded.scope,
       updated_at=now()
     `,
-    [params.user_email, params.athlete_id, params.access_token, params.refresh_token, params.expires_at, params.scope ?? null]
+    [
+      params.user_email,
+      params.athlete_id,
+      params.access_token,
+      params.refresh_token,
+      params.expires_at,
+      params.scope ?? null,
+    ]
   );
 }
 
-async function getConnectionByAthleteId(athleteId: number) {
-  const r = await pool.query(
-    `select * from strava_connections where athlete_id=$1`,
-    [athleteId]
-  );
+async function getConnectionByAthleteId(athleteId) {
+  const r = await pool.query(`select * from strava_connections where athlete_id=$1`, [
+    athleteId,
+  ]);
   return r.rows[0] ?? null;
 }
 
-async function refreshTokenIfNeeded(conn: any): Promise<string> {
+async function refreshTokenIfNeeded(conn) {
   const now = Math.floor(Date.now() / 1000);
   if (conn.expires_at && now < Number(conn.expires_at) - 60) {
     return conn.access_token;
@@ -170,17 +176,14 @@ async function refreshTokenIfNeeded(conn: any): Promise<string> {
 // ---------- HEALTH ----------
 app.get("/health", async (req, res) => {
   try {
-    await ensureSchema();
     const now = await dbNow();
     return res.json({ status: "ok", db: "ok", now });
-  } catch (e: any) {
+  } catch (e) {
     return res.status(500).json({ status: "error", error: String(e?.message ?? e) });
   }
 });
 
 // ---------- OAUTH (multi-user) ----------
-// Base44 wird später hier die echte user_email mitschicken.
-// Für den Dummy-Test gibst du sie als Query mit: /auth/strava/start?email=...
 app.get("/auth/strava/start", async (req, res) => {
   const userEmail = String(req.query.email ?? "").trim().toLowerCase();
   if (!userEmail) return res.status(400).send("Missing ?email=...");
@@ -231,6 +234,7 @@ app.get("/auth/strava/callback", async (req, res) => {
     }
 
     const athleteId = Number(tokenJson?.athlete?.id);
+
     await upsertConnection({
       user_email: stateRow.user_email,
       athlete_id: athleteId,
@@ -248,7 +252,7 @@ app.get("/auth/strava/callback", async (req, res) => {
       <p><a href="/strava/activities?athlete_id=${athleteId}">Letzte Aktivitäten</a></p>
       <p><a href="/webhooks/strava/test">Webhook Test Event senden</a></p>
     `);
-  } catch (e: any) {
+  } catch (e) {
     return res.status(500).send(String(e?.message ?? e));
   }
 });
@@ -271,14 +275,14 @@ app.get("/strava/activities", async (req, res) => {
     if (!r.ok) return res.status(500).json({ error: "Strava API error", details: data });
 
     const items = data
-      .map((a: any) => {
+      .map((a) => {
         const km = a.distance ? (a.distance / 1000).toFixed(2) : "0.00";
         return `<li><b>${a.type}</b> — ${a.name} — ${km} km — <a href="/strava/activity/${a.id}?athlete_id=${athleteId}">Details</a> — <a href="/strava/activity/${a.id}/streams?athlete_id=${athleteId}">Streams</a></li>`;
       })
       .join("");
 
     return res.send(`<h2>Letzte Aktivitäten</h2><ul>${items}</ul>`);
-  } catch (e: any) {
+  } catch (e) {
     return res.status(500).send(String(e?.message ?? e));
   }
 });
@@ -301,7 +305,7 @@ app.get("/strava/activity/:id", async (req, res) => {
     const data = await r.json();
     if (!r.ok) return res.status(500).json({ error: "Strava API error", details: data });
     return res.json(data);
-  } catch (e: any) {
+  } catch (e) {
     return res.status(500).send(String(e?.message ?? e));
   }
 });
@@ -318,15 +322,7 @@ app.get("/strava/activity/:id/streams", async (req, res) => {
     const id = req.params.id;
 
     const keys = [
-      "time",
-      "distance",
-      "heartrate",
-      "watts",
-      "cadence",
-      "velocity_smooth",
-      "altitude",
-      "grade_smooth",
-      "temp",
+      "time","distance","heartrate","watts","cadence","velocity_smooth","altitude","grade_smooth","temp",
     ].join(",");
 
     const r = await fetch(
@@ -337,7 +333,7 @@ app.get("/strava/activity/:id/streams", async (req, res) => {
     const data = await r.json();
     if (!r.ok) return res.status(500).json({ error: "Strava API error", details: data });
 
-    const summary = Object.keys(data).reduce((acc: any, k: string) => {
+    const summary = Object.keys(data).reduce((acc, k) => {
       acc[k] = {
         hasData: Array.isArray(data[k]?.data),
         points: Array.isArray(data[k]?.data) ? data[k].data.length : 0,
@@ -346,12 +342,13 @@ app.get("/strava/activity/:id/streams", async (req, res) => {
     }, {});
 
     return res.json({ summary, streams: data });
-  } catch (e: any) {
+  } catch (e) {
     return res.status(500).send(String(e?.message ?? e));
   }
 });
 
 // ---------- WEBHOOKS ----------
+
 // 1) Verify (Strava macht GET mit hub.challenge)
 app.get("/webhooks/strava", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -359,22 +356,22 @@ app.get("/webhooks/strava", (req, res) => {
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === STRAVA_WEBHOOK_VERIFY_TOKEN) {
-    return res.json({ "hub.challenge": challenge });
+    return res.status(200).json({ "hub.challenge": challenge });
   }
   return res.sendStatus(403);
 });
 
 // 2) Events (Strava sendet POST wenn Activity erstellt/updated/deleted)
 app.post("/webhooks/strava", async (req, res) => {
-  try {
-    // Wichtig: sofort 200 zurückgeben (Strava mag schnelle Antworten)
-    res.sendStatus(200);
+  // WICHTIG: sofort 200 zurückgeben (Strava hasst langsame Antworten)
+  res.sendStatus(200);
 
+  try {
     const event = req.body;
     const ownerId = Number(event?.owner_id);
     const activityId = Number(event?.object_id);
 
-    // speichern "roh"
+    // roh speichern
     await pool.query(
       `
       insert into workouts_raw(provider, athlete_id, activity_id, aspect_type, object_type, event_time, raw_event, status)
@@ -383,20 +380,24 @@ app.post("/webhooks/strava", async (req, res) => {
         raw_event=excluded.raw_event,
         updated_at=now()
       `,
-      [ownerId, activityId, event.aspect_type ?? null, event.object_type ?? null, event.event_time ?? null, JSON.stringify(event)]
+      [
+        ownerId,
+        activityId,
+        event.aspect_type ?? null,
+        event.object_type ?? null,
+        event.event_time ?? null,
+        JSON.stringify(event),
+      ]
     );
 
-    // Nur wenn es eine neue/aktualisierte activity ist:
+    // Nur Activity create/update weiterverarbeiten
     if (event.object_type !== "activity") return;
     if (!["create", "update"].includes(event.aspect_type)) return;
 
-    // => hol Activity + Streams und markiere als fetched
     await fetchAndStoreActivity(ownerId, activityId);
-
-    // => analysieren (Dummy) und dann an Base44 pushen
     await analyzeAndPushToBase44(ownerId, activityId);
   } catch (e) {
-    console.error("Webhook error:", e);
+    console.error("Webhook processing error:", e);
   }
 });
 
@@ -407,19 +408,21 @@ app.get("/webhooks/strava/test", async (req, res) => {
     event_time: Math.floor(Date.now() / 1000),
     object_id: 1234567890,
     object_type: "activity",
-    owner_id: 8401174,
+    owner_id: 8401174, // deine Test-Athlete ID
     subscription_id: 1,
     updates: {},
   };
+
   await fetch(`${PUBLIC_BASE_URL}/webhooks/strava`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(fake),
   });
-  return res.send("Sent test event (fake). Check DB logs.");
+
+  return res.send("Sent test event (fake). Check Render logs + DB.");
 });
 
-async function fetchAndStoreActivity(athleteId: number, activityId: number) {
+async function fetchAndStoreActivity(athleteId, activityId) {
   const conn = await getConnectionByAthleteId(athleteId);
   if (!conn) throw new Error(`No connection for athlete_id=${athleteId}`);
 
@@ -431,7 +434,7 @@ async function fetchAndStoreActivity(athleteId: number, activityId: number) {
   const actJson = await actResp.json();
   if (!actResp.ok) throw new Error(`Activity fetch failed: ${JSON.stringify(actJson)}`);
 
-  const keys = ["time", "distance", "heartrate", "watts", "cadence", "velocity_smooth", "altitude", "grade_smooth", "temp"].join(",");
+  const keys = ["time","distance","heartrate","watts","cadence","velocity_smooth","altitude","grade_smooth","temp"].join(",");
   const streamResp = await fetch(
     `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=${encodeURIComponent(keys)}&key_by_type=true`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -449,11 +452,10 @@ async function fetchAndStoreActivity(athleteId: number, activityId: number) {
   );
 }
 
-async function analyzeAndPushToBase44(athleteId: number, activityId: number) {
+async function analyzeAndPushToBase44(athleteId, activityId) {
   const conn = await getConnectionByAthleteId(athleteId);
   if (!conn) throw new Error(`No connection for athlete_id=${athleteId}`);
 
-  // --- Minimal-Analyse (Dummy): nur Summary aus raw_activity ziehen ---
   const r = await pool.query(
     `select raw_activity from workouts_raw where provider='strava' and activity_id=$1`,
     [activityId]
@@ -461,6 +463,7 @@ async function analyzeAndPushToBase44(athleteId: number, activityId: number) {
   const rawActivity = r.rows?.[0]?.raw_activity;
   if (!rawActivity) throw new Error("No raw_activity found to analyze");
 
+  // Minimal Analyse (Dummy)
   const analysis = {
     type: rawActivity.type,
     name: rawActivity.name,
@@ -480,14 +483,8 @@ async function analyzeAndPushToBase44(athleteId: number, activityId: number) {
     [JSON.stringify(analysis), activityId]
   );
 
-  // --- Push zu Base44 (DEIN Endpoint in Base44) ---
-  // Hier brauchst du in Base44 eine Function, die Kalender-Items anlegt.
-  // Beispiel: POST https://metabolyte.de/functions/ingestWorkout
-  //
-  // Das ist der einzige Teil, den wir noch in Base44 anlegen müssen.
-  const base44IngestUrl = "https://metabolyte.de/functions/ingestWorkout";
-
-  const pushResp = await fetch(base44IngestUrl, {
+  // Push zu Base44
+  const pushResp = await fetch(BASE44_INGEST_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -499,7 +496,7 @@ async function analyzeAndPushToBase44(athleteId: number, activityId: number) {
       athlete_id: athleteId,
       activity_id: activityId,
       analysis,
-      raw_activity: rawActivity, // optional – für spätere KI
+      raw_activity: rawActivity,
     }),
   });
 
@@ -520,6 +517,7 @@ async function analyzeAndPushToBase44(athleteId: number, activityId: number) {
 
 // ---------- START ----------
 const port = process.env.PORT || 3000;
+
 app.listen(port, async () => {
   await ensureSchema();
   console.log("Server running on port", port);
