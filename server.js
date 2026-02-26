@@ -182,3 +182,53 @@ app.get("/strava/activity/:id", async (req, res) => {
 // Render gibt PORT vor
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("Server running on port", port));
+
+// 6) Activity Streams (Zeitreihen) = quasi FIT-Inhalt (HR, Pace, Power etc.)
+app.get("/strava/activity/:id/streams", async (req, res) => {
+  try {
+    const accessToken = await getValidAccessToken();
+    const id = req.params.id;
+
+    // Welche Streams du willst:
+    const keys = [
+      "time",
+      "distance",
+      "heartrate",
+      "watts",
+      "cadence",
+      "velocity_smooth",
+      "altitude",
+      "grade_smooth",
+      "temp"
+    ].join(",");
+
+    const r = await fetch(
+      `https://www.strava.com/api/v3/activities/${id}/streams?keys=${encodeURIComponent(
+        keys
+      )}&key_by_type=true`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      }
+    );
+
+    const data = await r.json();
+
+    if (!r.ok) {
+      console.error("Strava streams error:", data);
+      return res.status(500).json({ error: "Strava API error", details: data });
+    }
+
+    // Nur ein kleiner Überblick (damit dein Browser nicht explodiert)
+    const summary = Object.keys(data).reduce((acc, k) => {
+      acc[k] = {
+        hasData: Array.isArray(data[k]?.data),
+        points: Array.isArray(data[k]?.data) ? data[k].data.length : 0
+      };
+      return acc;
+    }, {});
+
+    return res.json({ summary, streams: data });
+  } catch (e) {
+    return res.status(500).send(String(e?.message ?? e));
+  }
+});
