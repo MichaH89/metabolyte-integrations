@@ -4,7 +4,11 @@ import crypto from "crypto";
 const app = express();
 app.use(express.json());
 
-// 1) Health check (zum Testen ob Server lebt)
+// Super-simple token storage (NUR fürs Testen!)
+// Nach einem Render-Restart ist das weg.
+let stravaTokens = null;
+
+// 1) Health check
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 // Helper: env safe read
@@ -12,6 +16,45 @@ function mustGetEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
+}
+
+// Helper: valid access token (mit Refresh wenn abgelaufen)
+async function getValidAccessToken() {
+  if (!stravaTokens) {
+    throw new Error("Not connected to Strava. Open /auth/strava/start first.");
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+
+  // Token noch gültig?
+  if (stravaTokens.expires_at && now < stravaTokens.expires_at - 60) {
+    return stravaTokens.access_token;
+  }
+
+  // Refresh
+  const clientId = mustGetEnv("STRAVA_CLIENT_ID");
+  const clientSecret = mustGetEnv("STRAVA_CLIENT_SECRET");
+
+  const refreshResp = await fetch("https://www.strava.com/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      grant_type: "refresh_token",
+      refresh_token: stravaTokens.refresh_token,
+    }),
+  });
+
+  const refreshJson = await refreshResp.json();
+
+  if (!refreshResp.ok) {
+    console.error("Refresh failed:", refreshJson);
+    throw new Error("Refresh token failed");
+  }
+
+  stravaTokens = refreshJson; // neue Tokens speichern
+  return stravaTokens.access_token;
 }
 
 // 2) Start OAuth: Redirect zu Strava
@@ -22,11 +65,7 @@ app.get("/auth/strava/start", (req, res) => {
   // State = Schutz gegen Fake-Callbacks
   const state = crypto.randomBytes(16).toString("hex");
 
-  // TODO (später): state pro user speichern (DB). Für den ersten Test reicht das so.
-  // Wir senden es als Cookie zurück (super simpel)
-  res.cookie?.("strava_oauth_state", state); // falls cookie middleware nicht da ist, egal
-
-  const scope = "read,activity:read_all"; // <- HIER setzt du die Scopes!
+  const scope = "read,activity:read_all"; // Scopes kommen HIER rein
 
   const url =
     "https://www.strava.com/oauth/authorize" +
@@ -60,8 +99,8 @@ app.get("/auth/strava/callback", async (req, res) => {
         client_id: clientId,
         client_secret: clientSecret,
         code,
-        grant_type: "authorization_code"
-      })
+        grant_type: "authorization_code",
+      }),
     });
 
     const tokenJson = await tokenResp.json();
@@ -71,18 +110,72 @@ app.get("/auth/strava/callback", async (req, res) => {
       return res.status(500).json({ error: "Token exchange failed", details: tokenJson });
     }
 
-    // tokenJson enthält: access_token, refresh_token, expires_at, athlete {...}
-    // TODO (später): hier speichern wir es in Base44 Entities
-    return res.json({
-      ok: true,
-      received_scope: scope,
-      athlete_id: tokenJson.athlete?.id,
-      expires_at: tokenJson.expires_at
-      // NICHT tokens im Browser anzeigen in Produktion!
-    });
+    // Tokens merken (Testmodus)
+    stravaTokens = tokenJson;
+
+    // Simple "OK" Seite mit Link
+    return res.send(`
+      <h2>Strava verbunden ✅</h2>
+      <p>Athlete ID: ${tokenJson.athlete?.id}</p>
+      <p>Scope: ${scope}</p>
+      <p><a href="/strava/activities">Letzte Aktivitäten anzeigen</a></p>
+    `);
   } catch (err) {
     console.error(err);
     return res.status(500).send("Callback error");
+  }
+});
+
+// 4) Letzte Aktivitäten anzeigen (Top 10)
+app.get("/strava/activities", async (req, res) => {
+  try {
+    const accessToken = await getValidAccessToken();
+
+    const r = await fetch(
+      "https://www.strava.com/api/v3/athlete/activities?per_page=10&page=1",
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+
+    const data = await r.json();
+
+    if (!r.ok) {
+      console.error("Strava activities error:", data);
+      return res.status(500).json({ error: "Strava API error", details: data });
+    }
+
+    const items = data
+      .map((a) => {
+        const km = a.distance ? (a.distance / 1000).toFixed(2) : "0.00";
+        return `<li><b>${a.type}</b> — ${a.name} — ${km} km — <a href="/strava/activity/${a.id}">Details</a></li>`;
+      })
+      .join("");
+
+    return res.send(`<h2>Letzte Aktivitäten</h2><ul>${items}</ul>`);
+  } catch (e) {
+    return res.status(500).send(String(e?.message ?? e));
+  }
+});
+
+// 5) Activity Details (einzelne Aktivität)
+app.get("/strava/activity/:id", async (req, res) => {
+  try {
+    const accessToken = await getValidAccessToken();
+    const id = req.params.id;
+
+    const r = await fetch(`https://www.strava.com/api/v3/activities/${id}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    const data = await r.json();
+
+    if (!r.ok) {
+      console.error("Strava activity detail error:", data);
+      return res.status(500).json({ error: "Strava API error", details: data });
+    }
+
+    return res.json(data);
+  } catch (e) {
+    return res.status(500).send(String(e?.message ?? e));
   }
 });
 
