@@ -532,4 +532,14 @@ app.get("/debug/connections", async (req, res) => {
     "select user_email, athlete_id, expires_at, scope, updated_at from strava_connections order by updated_at desc limit 20"
   );
   res.json(r.rows);
+  
+});
+app.get("/debug/workouts", async (req, res) => {
+  const r = await pool.query(`
+    select id, athlete_id, activity_id, aspect_type, status, error, created_at, updated_at
+    from workouts_raw
+    order by updated_at desc
+    limit 20
+  `);
+  res.json(r.rows);
 });
