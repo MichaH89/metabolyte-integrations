@@ -394,8 +394,19 @@ app.post("/webhooks/strava", async (req, res) => {
     if (event.object_type !== "activity") return;
     if (!["create", "update"].includes(event.aspect_type)) return;
 
-    await fetchAndStoreActivity(ownerId, activityId);
-    await analyzeAndPushToBase44(ownerId, activityId);
+    try {
+  await fetchAndStoreActivity(ownerId, activityId);
+  await analyzeAndPushToBase44(ownerId, activityId);
+} catch (e) {
+  console.error("Processing pipeline error:", e);
+
+  await pool.query(
+    `update workouts_raw
+     set status='error', error=$1, updated_at=now()
+     where provider='strava' and activity_id=$2`,
+    [String(e?.message ?? e), activityId]
+  );
+}
   } catch (e) {
     console.error("Webhook processing error:", e);
   }
