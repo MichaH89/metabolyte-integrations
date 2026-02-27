@@ -4,8 +4,6 @@ import cookieParser from "cookie-parser";
 import { Pool } from "pg";
 
 const app = express();
-
-// Strava Webhooks schicken JSON – wir akzeptieren alles
 app.use(express.json({ type: "*/*" }));
 app.use(cookieParser());
 
@@ -21,13 +19,15 @@ const STRAVA_CLIENT_SECRET = mustGetEnv("STRAVA_CLIENT_SECRET");
 const STRAVA_REDIRECT_URI = mustGetEnv("STRAVA_REDIRECT_URI");
 const STRAVA_WEBHOOK_VERIFY_TOKEN = mustGetEnv("STRAVA_WEBHOOK_VERIFY_TOKEN");
 const PUBLIC_BASE_URL = mustGetEnv("PUBLIC_BASE_URL");
+
 const BASE44_INGEST_SECRET = mustGetEnv("BASE44_INGEST_SECRET");
 const BASE44_INGEST_URL = mustGetEnv("BASE44_INGEST_URL");
+// optional später:
+// const BASE44_PLAN_LOOKUP_URL = process.env.BASE44_PLAN_LOOKUP_URL;
 
 // ---------- DB ----------
 const pool = new Pool({
   connectionString: mustGetEnv("DATABASE_URL"),
-  // Render Postgres braucht oft SSL, lokal meistens nicht
   ssl: process.env.DATABASE_URL?.includes("render.com")
     ? { rejectUnauthorized: false }
     : undefined,
@@ -136,7 +136,7 @@ async function upsertConnection(params) {
 
 async function getConnectionByAthleteId(athleteId) {
   const r = await pool.query(`select * from strava_connections where athlete_id=$1`, [
-    athleteId,
+    Number(athleteId),
   ]);
   return r.rows[0] ?? null;
 }
@@ -176,11 +176,30 @@ async function refreshTokenIfNeeded(conn) {
 // ---------- HEALTH ----------
 app.get("/health", async (req, res) => {
   try {
+    await ensureSchema();
     const now = await dbNow();
     return res.json({ status: "ok", db: "ok", now });
   } catch (e) {
     return res.status(500).json({ status: "error", error: String(e?.message ?? e) });
   }
+});
+
+// ---------- DEBUG ----------
+app.get("/debug/connections", async (req, res) => {
+  const r = await pool.query(
+    "select user_email, athlete_id, expires_at, scope, updated_at from strava_connections order by updated_at desc limit 50"
+  );
+  res.json(r.rows);
+});
+
+app.get("/debug/workouts", async (req, res) => {
+  const r = await pool.query(`
+    select id, athlete_id, activity_id, aspect_type, status, error, created_at, updated_at
+    from workouts_raw
+    order by updated_at desc
+    limit 50
+  `);
+  res.json(r.rows);
 });
 
 // ---------- OAUTH (multi-user) ----------
@@ -215,7 +234,9 @@ app.get("/auth/strava/callback", async (req, res) => {
     if (!state) return res.status(400).send("Missing ?state from Strava");
 
     const stateRow = await consumeOAuthState(state);
-    if (!stateRow) return res.status(400).send("Invalid/expired state. Please retry /auth/strava/start.");
+    if (!stateRow) {
+      return res.status(400).send("Invalid/expired state. Please retry /auth/strava/start.");
+    }
 
     const tokenResp = await fetch("https://www.strava.com/oauth/token", {
       method: "POST",
@@ -250,7 +271,6 @@ app.get("/auth/strava/callback", async (req, res) => {
       <p>Athlete ID: ${athleteId}</p>
       <p>Scope: ${scope}</p>
       <p><a href="/strava/activities?athlete_id=${athleteId}">Letzte Aktivitäten</a></p>
-      <p><a href="/webhooks/strava/test">Webhook Test Event senden</a></p>
     `);
   } catch (e) {
     return res.status(500).send(String(e?.message ?? e));
@@ -268,9 +288,11 @@ app.get("/strava/activities", async (req, res) => {
 
     const accessToken = await refreshTokenIfNeeded(conn);
 
-    const r = await fetch("https://www.strava.com/api/v3/athlete/activities?per_page=10&page=1", {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
+    const r = await fetch(
+      "https://www.strava.com/api/v3/athlete/activities?per_page=10&page=1",
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+
     const data = await r.json();
     if (!r.ok) return res.status(500).json({ error: "Strava API error", details: data });
 
@@ -322,11 +344,21 @@ app.get("/strava/activity/:id/streams", async (req, res) => {
     const id = req.params.id;
 
     const keys = [
-      "time","distance","heartrate","watts","cadence","velocity_smooth","altitude","grade_smooth","temp",
+      "time",
+      "distance",
+      "heartrate",
+      "watts",
+      "cadence",
+      "velocity_smooth",
+      "altitude",
+      "grade_smooth",
+      "temp",
     ].join(",");
 
     const r = await fetch(
-      `https://www.strava.com/api/v3/activities/${id}/streams?keys=${encodeURIComponent(keys)}&key_by_type=true`,
+      `https://www.strava.com/api/v3/activities/${id}/streams?keys=${encodeURIComponent(
+        keys
+      )}&key_by_type=true`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
 
@@ -363,7 +395,7 @@ app.get("/webhooks/strava", (req, res) => {
 
 // 2) Events (Strava sendet POST wenn Activity erstellt/updated/deleted)
 app.post("/webhooks/strava", async (req, res) => {
-  // WICHTIG: sofort 200 zurückgeben (Strava hasst langsame Antworten)
+  // WICHTIG: sofort 200 zurückgeben
   res.sendStatus(200);
 
   try {
@@ -394,25 +426,25 @@ app.post("/webhooks/strava", async (req, res) => {
     if (event.object_type !== "activity") return;
     if (!["create", "update"].includes(event.aspect_type)) return;
 
+    // Pipeline mit sauberem Error-Handling
     try {
-  await fetchAndStoreActivity(ownerId, activityId);
-  await analyzeAndPushToBase44(ownerId, activityId);
-} catch (e) {
-  console.error("Processing pipeline error:", e);
-
-  await pool.query(
-    `update workouts_raw
-     set status='error', error=$1, updated_at=now()
-     where provider='strava' and activity_id=$2`,
-    [String(e?.message ?? e), activityId]
-  );
-}
+      await fetchAndStoreActivity(ownerId, activityId);
+      await analyzeAndPushToBase44(ownerId, activityId);
+    } catch (e) {
+      console.error("Processing pipeline error:", e);
+      await pool.query(
+        `update workouts_raw
+         set status='error', error=$1, updated_at=now()
+         where provider='strava' and activity_id=$2`,
+        [String(e?.message ?? e), activityId]
+      );
+    }
   } catch (e) {
     console.error("Webhook processing error:", e);
   }
 });
 
-// Kleiner Test: du kannst dir selbst ein Event schicken
+// Kleiner Test: Fake Event an deinen eigenen Webhook schicken
 app.get("/webhooks/strava/test", async (req, res) => {
   const fake = {
     aspect_type: "create",
@@ -435,10 +467,10 @@ app.get("/webhooks/strava/test", async (req, res) => {
 
 async function fetchAndStoreActivity(athleteId, activityId) {
   const conn = await getConnectionByAthleteId(athleteId);
- if (!conn) {
-  console.warn(`Webhook for athlete_id=${athleteId} but no OAuth connection yet.`);
-  return;
-}
+  if (!conn) {
+    console.warn(`Webhook for athlete_id=${athleteId} but no OAuth connection yet.`);
+    return;
+  }
 
   const accessToken = await refreshTokenIfNeeded(conn);
 
@@ -448,11 +480,25 @@ async function fetchAndStoreActivity(athleteId, activityId) {
   const actJson = await actResp.json();
   if (!actResp.ok) throw new Error(`Activity fetch failed: ${JSON.stringify(actJson)}`);
 
-  const keys = ["time","distance","heartrate","watts","cadence","velocity_smooth","altitude","grade_smooth","temp"].join(",");
+  const keys = [
+    "time",
+    "distance",
+    "heartrate",
+    "watts",
+    "cadence",
+    "velocity_smooth",
+    "altitude",
+    "grade_smooth",
+    "temp",
+  ].join(",");
+
   const streamResp = await fetch(
-    `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=${encodeURIComponent(keys)}&key_by_type=true`,
+    `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=${encodeURIComponent(
+      keys
+    )}&key_by_type=true`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
+
   const streamJson = await streamResp.json();
   if (!streamResp.ok) throw new Error(`Streams fetch failed: ${JSON.stringify(streamJson)}`);
 
@@ -462,42 +508,209 @@ async function fetchAndStoreActivity(athleteId, activityId) {
     set raw_activity=$1, raw_streams=$2, status='fetched', updated_at=now()
     where provider='strava' and activity_id=$3
     `,
-    [JSON.stringify(actJson), JSON.stringify(streamJson), activityId]
+    [JSON.stringify(actJson), JSON.stringify(streamJson), Number(activityId)]
   );
 }
 
+// ---------- ANALYSIS + PUSH ----------
 async function analyzeAndPushToBase44(athleteId, activityId) {
   const conn = await getConnectionByAthleteId(athleteId);
   if (!conn) throw new Error(`No connection for athlete_id=${athleteId}`);
 
-  const r = await pool.query(
-    `select raw_activity from workouts_raw where provider='strava' and activity_id=$1`,
-    [activityId]
+  const rr = await pool.query(
+    `select raw_activity, raw_streams
+     from workouts_raw
+     where provider='strava' and activity_id=$1`,
+    [Number(activityId)]
   );
-  const rawActivity = r.rows?.[0]?.raw_activity;
+
+  const rawActivity = rr.rows?.[0]?.raw_activity;
+  const rawStreams = rr.rows?.[0]?.raw_streams;
+
   if (!rawActivity) throw new Error("No raw_activity found to analyze");
 
-  // Minimal Analyse (Dummy)
+  // -------- Helpers --------
+  function safeNum(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function round2(n) {
+    if (n == null) return null;
+    return Math.round(n * 100) / 100;
+  }
+
+  function secondsToHhMmSs(sec) {
+    const s = Math.max(0, Math.floor(sec || 0));
+    const hh = Math.floor(s / 3600);
+    const mm = Math.floor((s % 3600) / 60);
+    const ss = s % 60;
+    if (hh > 0) return `${hh}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+    return `${mm}:${String(ss).padStart(2, "0")}`;
+  }
+
+  function paceSecPerKm(distanceM, movingTimeS) {
+    if (!distanceM || !movingTimeS || distanceM <= 0 || movingTimeS <= 0) return null;
+    const km = distanceM / 1000;
+    return movingTimeS / km;
+  }
+
+  function detectIntervalsFromSeries(series, opts) {
+    if (!Array.isArray(series) || series.length < 80) {
+      return { peakCount: 0, hardFraction: 0, baseline: null, threshold: null };
+    }
+    const values = series.map(Number).filter((x) => Number.isFinite(x) && x > 0);
+    if (values.length < 80) return { peakCount: 0, hardFraction: 0, baseline: null, threshold: null };
+
+    const sorted = [...values].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+
+    const multiplier = opts?.multiplier ?? 1.18;
+    const threshold = median * multiplier;
+
+    let hard = 0;
+    for (const v of values) if (v >= threshold) hard++;
+    const hardFraction = hard / values.length;
+
+    const minSeg = opts?.minSeg ?? 20;
+    let peakCount = 0;
+    let runLen = 0;
+    let inHard = false;
+
+    for (let i = 0; i < values.length; i++) {
+      const isHard = values[i] >= threshold;
+      if (isHard) {
+        runLen++;
+        if (!inHard) inHard = true;
+      } else {
+        if (inHard && runLen >= minSeg) peakCount++;
+        inHard = false;
+        runLen = 0;
+      }
+    }
+    if (inHard && runLen >= minSeg) peakCount++;
+
+    return { peakCount, hardFraction, baseline: median, threshold };
+  }
+
+  function classifyWorkout({ type, moving_time, distance }, streams) {
+    const durationS = safeNum(moving_time) ?? 0;
+
+    const isRun = String(type || "").toLowerCase() === "run";
+    const isRide = String(type || "").toLowerCase() === "ride";
+
+    const velocity = streams?.velocity_smooth?.data;
+    const watts = streams?.watts?.data;
+
+    const intervalSource = isRide ? watts : velocity;
+    const intervals = detectIntervalsFromSeries(intervalSource, {
+      multiplier: isRide ? 1.22 : 1.18,
+      minSeg: isRide ? 25 : 20,
+    });
+
+    const longThresholdS = isRun ? 90 * 60 : 120 * 60;
+    const isLong = durationS >= longThresholdS;
+
+    const hasIntervals = intervals.peakCount >= 3 && intervals.hardFraction >= 0.08;
+    const isSteadyHard = intervals.hardFraction >= 0.18 && intervals.peakCount < 3;
+
+    let category = "Aerobic Base";
+    let confidence = 0.65;
+    const tags = [];
+    const signals = {
+      hasIntervals,
+      peakCount: intervals.peakCount,
+      hardFraction: round2(intervals.hardFraction),
+      isLong,
+      isSteadyHard,
+    };
+
+    if (hasIntervals) {
+      category = "VO2 / Intervals";
+      confidence = 0.8;
+      tags.push("key_session");
+    } else if (isSteadyHard) {
+      category = "Threshold / Tempo";
+      confidence = 0.7;
+      tags.push("quality");
+    } else if (isLong) {
+      category = "Long Endurance";
+      confidence = 0.75;
+      tags.push("endurance");
+    } else {
+      category = "Aerobic Base";
+      confidence = 0.65;
+      tags.push("base");
+    }
+
+    if (isRun) tags.push("run");
+    if (isRide) tags.push("ride");
+    if (!isRun && !isRide) tags.push(String(type || "other").toLowerCase());
+
+    return { category, tags, confidence, signals };
+  }
+
+  function nextSunday18BerlinIso() {
+    const now = new Date();
+    const d = new Date(now);
+    const day = d.getDay(); // 0=Sun
+    const addDays = (7 - day) % 7;
+    d.setDate(d.getDate() + addDays);
+    d.setHours(18, 0, 0, 0);
+    if (addDays === 0 && now.getTime() > d.getTime()) d.setDate(d.getDate() + 7);
+    return d.toISOString();
+  }
+
+  // -------- Metrics + Classification --------
+  const durationS = safeNum(rawActivity.moving_time) ?? 0;
+  const distanceM = safeNum(rawActivity.distance) ?? 0;
+  const distanceKm = distanceM ? distanceM / 1000 : null;
+
+  const pace = paceSecPerKm(distanceM, durationS);
+  const classification = classifyWorkout(
+    { type: rawActivity.type, moving_time: rawActivity.moving_time, distance: rawActivity.distance },
+    rawStreams
+  );
+
   const analysis = {
+    provider: "strava",
     type: rawActivity.type,
     name: rawActivity.name,
     start_date: rawActivity.start_date,
-    moving_time: rawActivity.moving_time,
-    distance_m: rawActivity.distance,
-    avg_hr: rawActivity.average_heartrate,
-    avg_watts: rawActivity.average_watts,
+    moving_time: durationS,
+    moving_time_hms: secondsToHhMmSs(durationS),
+    distance_m: distanceM,
+    distance_km: distanceKm != null ? round2(distanceKm) : null,
+    avg_hr: safeNum(rawActivity.average_heartrate),
+    avg_watts: safeNum(rawActivity.average_watts),
+    avg_pace_sec_per_km: pace != null ? Math.round(pace) : null,
+    avg_pace_min_per_km:
+      pace != null
+        ? `${Math.floor(pace / 60)}:${String(Math.round(pace % 60)).padStart(2, "0")}`
+        : null,
+    classification,
+    // Soll/Ist kommt als nächster Schritt (Plan Lookup)
+    coach: {
+      action: "comment_only",
+      requires_confirmation: false,
+      update_weekly_plan: true,
+      message:
+        "Einheit importiert und klassifiziert. Soll/Ist-Vergleich folgt, sobald geplante Sessions als Entity verfügbar sind.",
+      next_sunday_update_at: nextSunday18BerlinIso(),
+    },
   };
 
+  // Save analysis
   await pool.query(
     `
     update workouts_raw
     set analysis=$1, status='analyzed', updated_at=now()
     where provider='strava' and activity_id=$2
     `,
-    [JSON.stringify(analysis), activityId]
+    [JSON.stringify(analysis), Number(activityId)]
   );
 
-  // Push zu Base44
+  // Push to Base44
   const pushResp = await fetch(BASE44_INGEST_URL, {
     method: "POST",
     headers: {
@@ -507,25 +720,28 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
     body: JSON.stringify({
       provider: "strava",
       user_email: conn.user_email,
-      athlete_id: athleteId,
-      activity_id: activityId,
+      athlete_id: Number(athleteId),
+      activity_id: Number(activityId),
       analysis,
       raw_activity: rawActivity,
+      // raw_streams: rawStreams, // optional (kann riesig werden)
     }),
   });
 
   const pushJson = await pushResp.json().catch(() => ({}));
   if (!pushResp.ok) {
     await pool.query(
-      `update workouts_raw set status='error', error=$1, updated_at=now() where provider='strava' and activity_id=$2`,
-      [`Base44 ingest failed: ${JSON.stringify(pushJson)}`, activityId]
+      `update workouts_raw set status='error', error=$1, updated_at=now()
+       where provider='strava' and activity_id=$2`,
+      [`Base44 ingest failed: ${JSON.stringify(pushJson)}`, Number(activityId)]
     );
     return;
   }
 
   await pool.query(
-    `update workouts_raw set status='written_to_calendar', updated_at=now() where provider='strava' and activity_id=$1`,
-    [activityId]
+    `update workouts_raw set status='written_to_calendar', updated_at=now()
+     where provider='strava' and activity_id=$1`,
+    [Number(activityId)]
   );
 }
 
@@ -537,20 +753,4 @@ app.listen(port, async () => {
   console.log("Server running on port", port);
   console.log("Health:", `${PUBLIC_BASE_URL}/health`);
   console.log("Strava OAuth start example:", `${PUBLIC_BASE_URL}/auth/strava/start?email=test@example.com`);
-});
-app.get("/debug/connections", async (req, res) => {
-  const r = await pool.query(
-    "select user_email, athlete_id, expires_at, scope, updated_at from strava_connections order by updated_at desc limit 20"
-  );
-  res.json(r.rows);
-  
-});
-app.get("/debug/workouts", async (req, res) => {
-  const r = await pool.query(`
-    select id, athlete_id, activity_id, aspect_type, status, error, created_at, updated_at
-    from workouts_raw
-    order by updated_at desc
-    limit 20
-  `);
-  res.json(r.rows);
 });
