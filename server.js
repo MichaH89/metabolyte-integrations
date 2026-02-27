@@ -79,6 +79,12 @@ async function ensureSchema() {
       updated_at timestamptz default now(),
       unique(provider, activity_id)
     );
+
+        create table if not exists metabolic_profiles (
+      user_email text primary key,
+      profile_json jsonb not null,
+      updated_at timestamptz default now()
+    );
   `);
 }
 
@@ -202,6 +208,53 @@ app.get("/debug/workouts", async (req, res) => {
     limit 50
   `);
   res.json(r.rows);
+});
+
+app.get("/debug/profiles", async (req, res) => {
+  const r = await pool.query(
+    "select user_email, updated_at, profile_json from metabolic_profiles order by updated_at desc limit 50"
+  );
+  res.json(r.rows);
+});
+
+// ---------- PROFILE SYNC (Base44 -> Render) ----------
+// Base44 callt das, wenn Profil neu berechnet wurde
+app.post("/internal/profile/update", async (req, res) => {
+  try {
+    // 1) Secret check (damit es niemand anderes callen kann)
+    const got = String(req.headers["x-profile-sync-secret"] || "");
+    const expected = String(process.env.PROFILE_SYNC_SECRET || "");
+    if (!expected) {
+      return res.status(500).json({ error: "PROFILE_SYNC_SECRET not configured" });
+    }
+    if (got !== expected) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    // 2) Payload check
+    const profile = req.body || {};
+    const userEmail = String(profile.user_email || "").trim().toLowerCase();
+    if (!userEmail) {
+      return res.status(400).json({ error: "Missing profile.user_email" });
+    }
+
+    // 3) Upsert (überschreiben)
+    await pool.query(
+      `
+      insert into metabolic_profiles(user_email, profile_json)
+      values($1, $2)
+      on conflict (user_email) do update set
+        profile_json=excluded.profile_json,
+        updated_at=now()
+      `,
+      [userEmail, JSON.stringify(profile)]
+    );
+
+    return res.json({ ok: true, user_email: userEmail });
+  } catch (e) {
+    console.error("profile update error:", e);
+    return res.status(500).json({ error: String(e?.message ?? e) });
+  }
 });
 
 // ---------- OAUTH (multi-user) ----------
