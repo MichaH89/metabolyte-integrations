@@ -219,6 +219,16 @@ app.get("/debug/profiles", async (req, res) => {
   res.json(r.rows);
 });
 
+app.get("/debug/oauth_states", async (req, res) => {
+  const r = await pool.query(`
+    select id, state, user_email, provider, expires_at, created_at
+    from oauth_state
+    order by created_at desc
+    limit 50
+  `);
+  res.json(r.rows);
+});
+
 // ---------- PROFILE SYNC (Base44 -> Render) ----------
 app.post("/internal/profile/update", async (req, res) => {
   try {
