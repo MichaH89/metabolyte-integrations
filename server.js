@@ -23,8 +23,7 @@ const PUBLIC_BASE_URL = mustGetEnv("PUBLIC_BASE_URL");
 const BASE44_INGEST_SECRET = mustGetEnv("BASE44_INGEST_SECRET");
 const BASE44_INGEST_URL = mustGetEnv("BASE44_INGEST_URL");
 
-// ✅ NEU: Plan lookup function in Base44
-// z.B. https://metabolyte.de/functions/getPlannedSessionForDate
+// Optional: Base44 Plan lookup function (e.g. https://metabolyte.de/functions/getPlannedSessionForDate)
 const BASE44_PLAN_LOOKUP_URL = process.env.BASE44_PLAN_LOOKUP_URL || "";
 
 // ---------- DB ----------
@@ -35,7 +34,7 @@ const pool = new Pool({
     : undefined,
 });
 
-// Create tables if not exist (super simple migration)
+// Create tables if not exist
 async function ensureSchema() {
   await pool.query(`
     create table if not exists strava_connections (
@@ -80,7 +79,7 @@ async function ensureSchema() {
       unique(provider, activity_id)
     );
 
-        create table if not exists metabolic_profiles (
+    create table if not exists metabolic_profiles (
       user_email text primary key,
       profile_json jsonb not null,
       updated_at timestamptz default now()
@@ -218,27 +217,17 @@ app.get("/debug/profiles", async (req, res) => {
 });
 
 // ---------- PROFILE SYNC (Base44 -> Render) ----------
-// Base44 callt das, wenn Profil neu berechnet wurde
 app.post("/internal/profile/update", async (req, res) => {
   try {
-    // 1) Secret check (damit es niemand anderes callen kann)
     const got = String(req.headers["x-profile-sync-secret"] || "");
     const expected = String(process.env.PROFILE_SYNC_SECRET || "");
-    if (!expected) {
-      return res.status(500).json({ error: "PROFILE_SYNC_SECRET not configured" });
-    }
-    if (got !== expected) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
+    if (!expected) return res.status(500).json({ error: "PROFILE_SYNC_SECRET not configured" });
+    if (got !== expected) return res.status(401).json({ error: "Unauthorized" });
 
-    // 2) Payload check
     const profile = req.body || {};
     const userEmail = String(profile.user_email || "").trim().toLowerCase();
-    if (!userEmail) {
-      return res.status(400).json({ error: "Missing profile.user_email" });
-    }
+    if (!userEmail) return res.status(400).json({ error: "Missing profile.user_email" });
 
-    // 3) Upsert (überschreiben)
     await pool.query(
       `
       insert into metabolic_profiles(user_email, profile_json)
@@ -289,9 +278,7 @@ app.get("/auth/strava/callback", async (req, res) => {
     if (!state) return res.status(400).send("Missing ?state from Strava");
 
     const stateRow = await consumeOAuthState(state);
-    if (!stateRow) {
-      return res.status(400).send("Invalid/expired state. Please retry /auth/strava/start.");
-    }
+    if (!stateRow) return res.status(400).send("Invalid/expired state. Please retry /auth/strava/start.");
 
     const tokenResp = await fetch("https://www.strava.com/oauth/token", {
       method: "POST",
@@ -305,9 +292,7 @@ app.get("/auth/strava/callback", async (req, res) => {
     });
 
     const tokenJson = await tokenResp.json();
-    if (!tokenResp.ok) {
-      return res.status(500).json({ error: "Token exchange failed", details: tokenJson });
-    }
+    if (!tokenResp.ok) return res.status(500).json({ error: "Token exchange failed", details: tokenJson });
 
     const athleteId = Number(tokenJson?.athlete?.id);
 
@@ -411,9 +396,7 @@ app.get("/strava/activity/:id/streams", async (req, res) => {
     ].join(",");
 
     const r = await fetch(
-      `https://www.strava.com/api/v3/activities/${id}/streams?keys=${encodeURIComponent(
-        keys
-      )}&key_by_type=true`,
+      `https://www.strava.com/api/v3/activities/${id}/streams?keys=${encodeURIComponent(keys)}&key_by_type=true`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
 
@@ -435,8 +418,6 @@ app.get("/strava/activity/:id/streams", async (req, res) => {
 });
 
 // ---------- WEBHOOKS ----------
-
-// 1) Verify (Strava macht GET mit hub.challenge)
 app.get("/webhooks/strava", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -448,9 +429,7 @@ app.get("/webhooks/strava", (req, res) => {
   return res.sendStatus(403);
 });
 
-// 2) Events (Strava sendet POST wenn Activity erstellt/updated/deleted)
 app.post("/webhooks/strava", async (req, res) => {
-  // WICHTIG: sofort 200 zurückgeben
   res.sendStatus(200);
 
   try {
@@ -458,7 +437,6 @@ app.post("/webhooks/strava", async (req, res) => {
     const ownerId = Number(event?.owner_id);
     const activityId = Number(event?.object_id);
 
-    // roh speichern
     await pool.query(
       `
       insert into workouts_raw(provider, athlete_id, activity_id, aspect_type, object_type, event_time, raw_event, status)
@@ -477,11 +455,9 @@ app.post("/webhooks/strava", async (req, res) => {
       ]
     );
 
-    // Nur Activity create/update weiterverarbeiten
     if (event.object_type !== "activity") return;
     if (!["create", "update"].includes(event.aspect_type)) return;
 
-    // Pipeline mit sauberem Error-Handling
     try {
       await fetchAndStoreActivity(ownerId, activityId);
       await analyzeAndPushToBase44(ownerId, activityId);
@@ -499,14 +475,13 @@ app.post("/webhooks/strava", async (req, res) => {
   }
 });
 
-// Kleiner Test: Fake Event an deinen eigenen Webhook schicken
 app.get("/webhooks/strava/test", async (req, res) => {
   const fake = {
     aspect_type: "create",
     event_time: Math.floor(Date.now() / 1000),
     object_id: 1234567890,
     object_type: "activity",
-    owner_id: 8401174, // deine Test-Athlete ID
+    owner_id: 8401174,
     subscription_id: 1,
     updates: {},
   };
@@ -548,9 +523,7 @@ async function fetchAndStoreActivity(athleteId, activityId) {
   ].join(",");
 
   const streamResp = await fetch(
-    `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=${encodeURIComponent(
-      keys
-    )}&key_by_type=true`,
+    `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=${encodeURIComponent(keys)}&key_by_type=true`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
 
@@ -567,10 +540,17 @@ async function fetchAndStoreActivity(athleteId, activityId) {
   );
 }
 
-// ---------- ANALYSIS + PUSH (mit Plan-Lookup + Soll/Ist + Coach Decision) ----------
+// ---------- ANALYSIS + PUSH ----------
 async function analyzeAndPushToBase44(athleteId, activityId) {
   const conn = await getConnectionByAthleteId(athleteId);
   if (!conn) throw new Error(`No connection for athlete_id=${athleteId}`);
+
+  // ---- Load metabolic profile (cached in Render DB) ----
+  const profRes = await pool.query(
+    "select profile_json from metabolic_profiles where user_email=$1",
+    [conn.user_email]
+  );
+  const metabolicProfile = profRes.rows?.[0]?.profile_json || null;
 
   const rr = await pool.query(
     `select raw_activity, raw_streams
@@ -608,6 +588,16 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
     if (!distanceM || !movingTimeS || distanceM <= 0 || movingTimeS <= 0) return null;
     const km = distanceM / 1000;
     return movingTimeS / km;
+  }
+
+  function paceStringToSec(p) {
+    if (!p) return null;
+    const parts = String(p).split(":");
+    if (parts.length !== 2) return null;
+    const min = Number(parts[0]);
+    const sec = Number(parts[1]);
+    if (!Number.isFinite(min) || !Number.isFinite(sec)) return null;
+    return min * 60 + sec;
   }
 
   function detectIntervalsFromSeries(series, opts) {
@@ -698,7 +688,6 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
       tags.push("base");
     }
 
-    // Map to CalendarSession.sport enum
     const sport = isRide ? "bike" : isRun ? "run" : "run";
     tags.push(sport);
 
@@ -765,11 +754,10 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
       reasons.push("duration_missing");
     }
 
-    // planned category should be stored in intensity_json.category (recommended)
     const plannedCategory = String(
       plannedSession?.intensity_json?.category ??
-      plannedSession?.structure_json?.category ??
-      ""
+        plannedSession?.structure_json?.category ??
+        ""
     ).trim();
 
     const actualCategory = String(analysis.classification?.category ?? "").trim();
@@ -822,8 +810,7 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
         action: "comment_only",
         requires_confirmation: false,
         update_weekly_plan: true,
-        message:
-          "Moderate Abweichung vom Plan. Ich berücksichtige das beim Wochenupdate am Sonntag.",
+        message: "Moderate Abweichung vom Plan. Ich berücksichtige das beim Wochenupdate am Sonntag.",
       };
     }
 
@@ -842,6 +829,19 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
   const distanceKm = distanceM ? distanceM / 1000 : null;
 
   const pace = paceSecPerKm(distanceM, durationS);
+
+  let intensityBasedOnProfile = null;
+  if (metabolicProfile && pace) {
+    const lt1 = paceStringToSec(metabolicProfile.current_lt1_pace);
+    const lt2 = paceStringToSec(metabolicProfile.current_lt2_pace);
+
+    if (lt1 && lt2) {
+      if (pace > lt1) intensityBasedOnProfile = "Below LT1 (aerobic easy)";
+      else if (pace <= lt1 && pace > lt2) intensityBasedOnProfile = "Between LT1 and LT2 (tempo)";
+      else if (pace <= lt2) intensityBasedOnProfile = "Above LT2 (threshold/VO2)";
+    }
+  }
+
   const classification = classifyWorkout(
     { type: rawActivity.type, moving_time: rawActivity.moving_time },
     rawStreams
@@ -873,7 +873,9 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
       tags: classification.tags,
       signals: classification.signals,
     },
-    inferred_sport: classification.sport, // run|bike
+    inferred_sport: classification.sport,
+    metabolic_profile_used: !!metabolicProfile,
+    intensity_based_on_profile: intensityBasedOnProfile,
   };
 
   // -------- Plan Lookup + Deviation + Coach decision --------
@@ -923,7 +925,7 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
       activity_id: Number(activityId),
       analysis,
       raw_activity: rawActivity,
-      // raw_streams: rawStreams, // optional
+      // raw_streams: rawStreams, // optional (kann riesig werden)
     }),
   });
 
