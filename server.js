@@ -23,8 +23,11 @@ const PUBLIC_BASE_URL = mustGetEnv("PUBLIC_BASE_URL");
 const BASE44_INGEST_SECRET = mustGetEnv("BASE44_INGEST_SECRET");
 const BASE44_INGEST_URL = mustGetEnv("BASE44_INGEST_URL");
 
-// Optional: Base44 Plan lookup function (e.g. https://metabolyte.de/functions/getPlannedSessionForDate)
+// Optional: Base44 Plan lookup function
 const BASE44_PLAN_LOOKUP_URL = process.env.BASE44_PLAN_LOOKUP_URL || "";
+
+// Optional: protect retry endpoint
+const RETRY_JOB_SECRET = process.env.RETRY_JOB_SECRET || "";
 
 // ---------- DB ----------
 const pool = new Pool({
@@ -278,7 +281,8 @@ app.get("/auth/strava/callback", async (req, res) => {
     if (!state) return res.status(400).send("Missing ?state from Strava");
 
     const stateRow = await consumeOAuthState(state);
-    if (!stateRow) return res.status(400).send("Invalid/expired state. Please retry /auth/strava/start.");
+    if (!stateRow)
+      return res.status(400).send("Invalid/expired state. Please retry /auth/strava/start.");
 
     const tokenResp = await fetch("https://www.strava.com/oauth/token", {
       method: "POST",
@@ -292,7 +296,8 @@ app.get("/auth/strava/callback", async (req, res) => {
     });
 
     const tokenJson = await tokenResp.json();
-    if (!tokenResp.ok) return res.status(500).json({ error: "Token exchange failed", details: tokenJson });
+    if (!tokenResp.ok)
+      return res.status(500).json({ error: "Token exchange failed", details: tokenJson });
 
     const athleteId = Number(tokenJson?.athlete?.id);
 
@@ -396,7 +401,9 @@ app.get("/strava/activity/:id/streams", async (req, res) => {
     ].join(",");
 
     const r = await fetch(
-      `https://www.strava.com/api/v3/activities/${id}/streams?keys=${encodeURIComponent(keys)}&key_by_type=true`,
+      `https://www.strava.com/api/v3/activities/${id}/streams?keys=${encodeURIComponent(
+        keys
+      )}&key_by_type=true`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
 
@@ -430,6 +437,7 @@ app.get("/webhooks/strava", (req, res) => {
 });
 
 app.post("/webhooks/strava", async (req, res) => {
+  // WICHTIG: sofort 200 zurückgeben
   res.sendStatus(200);
 
   try {
@@ -437,6 +445,7 @@ app.post("/webhooks/strava", async (req, res) => {
     const ownerId = Number(event?.owner_id);
     const activityId = Number(event?.object_id);
 
+    // roh speichern
     await pool.query(
       `
       insert into workouts_raw(provider, athlete_id, activity_id, aspect_type, object_type, event_time, raw_event, status)
@@ -455,19 +464,19 @@ app.post("/webhooks/strava", async (req, res) => {
       ]
     );
 
+    // nur Activity create/update
     if (event.object_type !== "activity") return;
     if (!["create", "update"].includes(event.aspect_type)) return;
 
-    try {
-    // Pipeline mit sauberem Error-Handling
+    // Pipeline
     try {
       const fetchedOk = await fetchAndStoreActivity(ownerId, activityId);
 
-      // Wenn Strava die Activity/Streams noch nicht liefert (404), dann NICHT analysieren.
-      // Wir lassen den Datensatz in "received" oder setzen optional "pending".
+      // Wenn Strava noch nicht liefert: NICHT analysieren.
       if (!fetchedOk) {
-        console.log(`Skip analyze: activity not ready yet (athlete=${ownerId}, activity=${activityId})`);
-        // Optional: Status auf "received" lassen oder "pending" setzen:
+        console.log(
+          `Skip analyze: activity not ready yet (athlete=${ownerId}, activity=${activityId})`
+        );
         await pool.query(
           `update workouts_raw
            set status='received', updated_at=now()
@@ -487,7 +496,12 @@ app.post("/webhooks/strava", async (req, res) => {
         [String(e?.message ?? e), activityId]
       );
     }
+  } catch (e) {
+    console.error("Webhook processing error:", e);
+  }
+});
 
+// Kleiner Test: Fake Event an deinen eigenen Webhook schicken
 app.get("/webhooks/strava/test", async (req, res) => {
   const fake = {
     aspect_type: "create",
@@ -508,21 +522,30 @@ app.get("/webhooks/strava/test", async (req, res) => {
   return res.send("Sent test event (fake). Check Render logs + DB.");
 });
 
+// ---------- Fetch + Store (returns boolean) ----------
 async function fetchAndStoreActivity(athleteId, activityId) {
   const conn = await getConnectionByAthleteId(athleteId);
   if (!conn) {
     console.warn(`Webhook for athlete_id=${athleteId} but no OAuth connection yet.`);
-    return;
+    return false;
   }
 
   const accessToken = await refreshTokenIfNeeded(conn);
 
+  // 1) Activity
   const actResp = await fetch(`https://www.strava.com/api/v3/activities/${activityId}`, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
-  const actJson = await actResp.json();
-  if (!actResp.ok) throw new Error(`Activity fetch failed: ${JSON.stringify(actJson)}`);
 
+  // Strava ist manchmal “zu schnell” mit dem Webhook -> Activity noch nicht da
+  if (actResp.status === 404) return false;
+
+  const actJson = await actResp.json();
+  if (!actResp.ok) {
+    throw new Error(`Activity fetch failed (${actResp.status}): ${JSON.stringify(actJson)}`);
+  }
+
+  // 2) Streams
   const keys = [
     "time",
     "distance",
@@ -536,12 +559,18 @@ async function fetchAndStoreActivity(athleteId, activityId) {
   ].join(",");
 
   const streamResp = await fetch(
-    `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=${encodeURIComponent(keys)}&key_by_type=true`,
+    `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=${encodeURIComponent(
+      keys
+    )}&key_by_type=true`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
 
+  if (streamResp.status === 404) return false;
+
   const streamJson = await streamResp.json();
-  if (!streamResp.ok) throw new Error(`Streams fetch failed: ${JSON.stringify(streamJson)}`);
+  if (!streamResp.ok) {
+    throw new Error(`Streams fetch failed (${streamResp.status}): ${JSON.stringify(streamJson)}`);
+  }
 
   await pool.query(
     `
@@ -551,6 +580,8 @@ async function fetchAndStoreActivity(athleteId, activityId) {
     `,
     [JSON.stringify(actJson), JSON.stringify(streamJson), Number(activityId)]
   );
+
+  return true;
 }
 
 // ---------- ANALYSIS + PUSH ----------
@@ -775,7 +806,8 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
 
     const actualCategory = String(analysis.classification?.category ?? "").trim();
 
-    const typeMismatch = plannedCategory && actualCategory && plannedCategory !== actualCategory ? 1 : 0;
+    const typeMismatch =
+      plannedCategory && actualCategory && plannedCategory !== actualCategory ? 1 : 0;
     if (typeMismatch) reasons.push("session_type_mismatch");
 
     const deviationScore = Math.min(1, 0.7 * durationDev + 0.3 * typeMismatch);
@@ -823,7 +855,8 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
         action: "comment_only",
         requires_confirmation: false,
         update_weekly_plan: true,
-        message: "Moderate Abweichung vom Plan. Ich berücksichtige das beim Wochenupdate am Sonntag.",
+        message:
+          "Moderate Abweichung vom Plan. Ich berücksichtige das beim Wochenupdate am Sonntag.",
       };
     }
 
@@ -938,7 +971,7 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
       activity_id: Number(activityId),
       analysis,
       raw_activity: rawActivity,
-      // raw_streams: rawStreams, // optional (kann riesig werden)
+      // raw_streams: rawStreams, // optional
     }),
   });
 
@@ -959,6 +992,65 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
   );
 }
 
+// ---------- RETRY JOB ENDPOINT ----------
+// Abarbeiten von "received" (falls Strava bei Webhook noch 404 geliefert hat)
+app.post("/internal/retry-pending", async (req, res) => {
+  try {
+    // Secret check (optional aber empfohlen)
+    if (RETRY_JOB_SECRET) {
+      const got = String(req.headers["x-retry-job-secret"] || "");
+      if (got !== RETRY_JOB_SECRET) return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const limit = Math.min(50, Number(req.query.limit || 20));
+    const r = await pool.query(
+      `
+      select athlete_id, activity_id
+      from workouts_raw
+      where provider='strava'
+        and status='received'
+      order by updated_at asc
+      limit $1
+      `,
+      [limit]
+    );
+
+    let processed = 0;
+    let fetched = 0;
+    let stillMissing = 0;
+    let errors = 0;
+
+    for (const row of r.rows) {
+      processed++;
+      const athleteId = Number(row.athlete_id);
+      const activityId = Number(row.activity_id);
+
+      try {
+        const ok = await fetchAndStoreActivity(athleteId, activityId);
+        if (!ok) {
+          stillMissing++;
+          continue;
+        }
+        fetched++;
+        await analyzeAndPushToBase44(athleteId, activityId);
+      } catch (e) {
+        errors++;
+        await pool.query(
+          `update workouts_raw
+           set status='error', error=$1, updated_at=now()
+           where provider='strava' and activity_id=$2`,
+          [String(e?.message ?? e), activityId]
+        );
+      }
+    }
+
+    return res.json({ ok: true, processed, fetched, stillMissing, errors });
+  } catch (e) {
+    console.error("retry job error:", e);
+    return res.status(500).json({ error: String(e?.message ?? e) });
+  }
+});
+
 // ---------- START ----------
 const port = process.env.PORT || 3000;
 
@@ -966,5 +1058,8 @@ app.listen(port, async () => {
   await ensureSchema();
   console.log("Server running on port", port);
   console.log("Health:", `${PUBLIC_BASE_URL}/health`);
-  console.log("Strava OAuth start example:", `${PUBLIC_BASE_URL}/auth/strava/start?email=test@example.com`);
+  console.log(
+    "Strava OAuth start example:",
+    `${PUBLIC_BASE_URL}/auth/strava/start?email=test@example.com`
+  );
 });
