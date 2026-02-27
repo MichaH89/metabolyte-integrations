@@ -22,8 +22,10 @@ const PUBLIC_BASE_URL = mustGetEnv("PUBLIC_BASE_URL");
 
 const BASE44_INGEST_SECRET = mustGetEnv("BASE44_INGEST_SECRET");
 const BASE44_INGEST_URL = mustGetEnv("BASE44_INGEST_URL");
-// optional später:
-// const BASE44_PLAN_LOOKUP_URL = process.env.BASE44_PLAN_LOOKUP_URL;
+
+// ✅ NEU: Plan lookup function in Base44
+// z.B. https://metabolyte.de/functions/getPlannedSessionForDate
+const BASE44_PLAN_LOOKUP_URL = process.env.BASE44_PLAN_LOOKUP_URL || "";
 
 // ---------- DB ----------
 const pool = new Pool({
@@ -512,7 +514,7 @@ async function fetchAndStoreActivity(athleteId, activityId) {
   );
 }
 
-// ---------- ANALYSIS + PUSH ----------
+// ---------- ANALYSIS + PUSH (mit Plan-Lookup + Soll/Ist + Coach Decision) ----------
 async function analyzeAndPushToBase44(athleteId, activityId) {
   const conn = await getConnectionByAthleteId(athleteId);
   if (!conn) throw new Error(`No connection for athlete_id=${athleteId}`);
@@ -593,7 +595,7 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
     return { peakCount, hardFraction, baseline: median, threshold };
   }
 
-  function classifyWorkout({ type, moving_time, distance }, streams) {
+  function classifyWorkout({ type, moving_time }, streams) {
     const durationS = safeNum(moving_time) ?? 0;
 
     const isRun = String(type || "").toLowerCase() === "run";
@@ -643,11 +645,16 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
       tags.push("base");
     }
 
-    if (isRun) tags.push("run");
-    if (isRide) tags.push("ride");
-    if (!isRun && !isRide) tags.push(String(type || "other").toLowerCase());
+    // Map to CalendarSession.sport enum
+    const sport = isRide ? "bike" : isRun ? "run" : "run";
+    tags.push(sport);
 
-    return { category, tags, confidence, signals };
+    return { category, tags, confidence, signals, sport };
+  }
+
+  function toDateYYYYMMDD(iso) {
+    if (!iso) return null;
+    return String(iso).slice(0, 10);
   }
 
   function nextSunday18BerlinIso() {
@@ -661,6 +668,121 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
     return d.toISOString();
   }
 
+  async function fetchPlannedSessionForDate(userEmail, dateYYYYMMDD) {
+    if (!BASE44_PLAN_LOOKUP_URL) return null;
+
+    try {
+      const resp = await fetch(BASE44_PLAN_LOOKUP_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-ingest-secret": BASE44_INGEST_SECRET,
+        },
+        body: JSON.stringify({ user_email: userEmail, date: dateYYYYMMDD }),
+      });
+
+      const json = await resp.json().catch(() => null);
+      if (!resp.ok) return null;
+      return json?.planned ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  function computeDeviation(plannedSession, analysis) {
+    if (!plannedSession) {
+      return {
+        has_plan: false,
+        deviation_score: null,
+        severity: "unknown",
+        reasons: ["no_plan_found"],
+      };
+    }
+
+    const reasons = [];
+    const plannedMin = safeNum(plannedSession.duration_min);
+    const actualMin = analysis.duration_min;
+
+    let durationDev = 0;
+    if (plannedMin && actualMin) {
+      durationDev = Math.abs(actualMin - plannedMin) / plannedMin;
+      if (durationDev >= 0.25) reasons.push("duration_off_25pct");
+      if (durationDev >= 0.4) reasons.push("duration_off_40pct");
+    } else {
+      reasons.push("duration_missing");
+    }
+
+    // planned category should be stored in intensity_json.category (recommended)
+    const plannedCategory = String(
+      plannedSession?.intensity_json?.category ??
+      plannedSession?.structure_json?.category ??
+      ""
+    ).trim();
+
+    const actualCategory = String(analysis.classification?.category ?? "").trim();
+
+    const typeMismatch = plannedCategory && actualCategory && plannedCategory !== actualCategory ? 1 : 0;
+    if (typeMismatch) reasons.push("session_type_mismatch");
+
+    const deviationScore = Math.min(1, 0.7 * durationDev + 0.3 * typeMismatch);
+
+    let severity = "low";
+    if (deviationScore >= 0.35) severity = "high";
+    else if (deviationScore >= 0.15) severity = "moderate";
+
+    return {
+      has_plan: true,
+      deviation_score: round2(deviationScore),
+      severity,
+      reasons,
+      planned: {
+        planned_duration_min: plannedMin ?? null,
+        planned_category: plannedCategory || null,
+        planned_status: plannedSession.status ?? null,
+      },
+    };
+  }
+
+  function decideCoachAction(deviation) {
+    if (!deviation?.has_plan) {
+      return {
+        action: "comment_only",
+        requires_confirmation: false,
+        update_weekly_plan: true,
+        message:
+          "Einheit importiert und klassifiziert. Für Soll/Ist-Vergleich fehlt noch eine geplante Session für diesen Tag.",
+      };
+    }
+
+    if (deviation.severity === "low") {
+      return {
+        action: "comment_only",
+        requires_confirmation: false,
+        update_weekly_plan: true,
+        message:
+          "Einheit entspricht dem Plan (nur kleine Abweichungen). Wochenplan wird Sonntag konsolidiert aktualisiert.",
+      };
+    }
+
+    if (deviation.severity === "moderate") {
+      return {
+        action: "comment_only",
+        requires_confirmation: false,
+        update_weekly_plan: true,
+        message:
+          "Moderate Abweichung vom Plan. Ich berücksichtige das beim Wochenupdate am Sonntag.",
+      };
+    }
+
+    return {
+      action: "ask_to_restructure_week",
+      requires_confirmation: true,
+      update_weekly_plan: false,
+      message:
+        "Die Einheit weicht deutlich vom Plan ab (z.B. Dauer/Intensität). Soll ich die Wochenstruktur anpassen, damit die Schlüsselsessions sinnvoll bleiben?",
+    };
+  }
+
   // -------- Metrics + Classification --------
   const durationS = safeNum(rawActivity.moving_time) ?? 0;
   const distanceM = safeNum(rawActivity.distance) ?? 0;
@@ -668,17 +790,21 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
 
   const pace = paceSecPerKm(distanceM, durationS);
   const classification = classifyWorkout(
-    { type: rawActivity.type, moving_time: rawActivity.moving_time, distance: rawActivity.distance },
+    { type: rawActivity.type, moving_time: rawActivity.moving_time },
     rawStreams
   );
+
+  const dateYYYYMMDD = toDateYYYYMMDD(rawActivity.start_date);
 
   const analysis = {
     provider: "strava",
     type: rawActivity.type,
     name: rawActivity.name,
     start_date: rawActivity.start_date,
+    date: dateYYYYMMDD,
     moving_time: durationS,
     moving_time_hms: secondsToHhMmSs(durationS),
+    duration_min: durationS ? Math.round(durationS / 60) : null,
     distance_m: distanceM,
     distance_km: distanceKm != null ? round2(distanceKm) : null,
     avg_hr: safeNum(rawActivity.average_heartrate),
@@ -688,16 +814,36 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
       pace != null
         ? `${Math.floor(pace / 60)}:${String(Math.round(pace % 60)).padStart(2, "0")}`
         : null,
-    classification,
-    // Soll/Ist kommt als nächster Schritt (Plan Lookup)
-    coach: {
-      action: "comment_only",
-      requires_confirmation: false,
-      update_weekly_plan: true,
-      message:
-        "Einheit importiert und klassifiziert. Soll/Ist-Vergleich folgt, sobald geplante Sessions als Entity verfügbar sind.",
-      next_sunday_update_at: nextSunday18BerlinIso(),
+    classification: {
+      category: classification.category,
+      confidence: classification.confidence,
+      tags: classification.tags,
+      signals: classification.signals,
     },
+    inferred_sport: classification.sport, // run|bike
+  };
+
+  // -------- Plan Lookup + Deviation + Coach decision --------
+  const planned = dateYYYYMMDD
+    ? await fetchPlannedSessionForDate(conn.user_email, dateYYYYMMDD)
+    : null;
+
+  const deviation = computeDeviation(planned, analysis);
+  const coachDecision = decideCoachAction(deviation);
+
+  analysis.planned = deviation.has_plan ? deviation.planned : null;
+  analysis.deviation = {
+    has_plan: deviation.has_plan,
+    deviation_score: deviation.deviation_score,
+    severity: deviation.severity,
+    reasons: deviation.reasons,
+  };
+  analysis.coach = {
+    action: coachDecision.action,
+    requires_confirmation: coachDecision.requires_confirmation,
+    update_weekly_plan: coachDecision.update_weekly_plan,
+    message: coachDecision.message,
+    next_sunday_update_at: nextSunday18BerlinIso(),
   };
 
   // Save analysis
@@ -724,7 +870,7 @@ async function analyzeAndPushToBase44(athleteId, activityId) {
       activity_id: Number(activityId),
       analysis,
       raw_activity: rawActivity,
-      // raw_streams: rawStreams, // optional (kann riesig werden)
+      // raw_streams: rawStreams, // optional
     }),
   });
 
