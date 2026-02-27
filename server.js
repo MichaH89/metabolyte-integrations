@@ -459,7 +459,24 @@ app.post("/webhooks/strava", async (req, res) => {
     if (!["create", "update"].includes(event.aspect_type)) return;
 
     try {
-      await fetchAndStoreActivity(ownerId, activityId);
+    // Pipeline mit sauberem Error-Handling
+    try {
+      const fetchedOk = await fetchAndStoreActivity(ownerId, activityId);
+
+      // Wenn Strava die Activity/Streams noch nicht liefert (404), dann NICHT analysieren.
+      // Wir lassen den Datensatz in "received" oder setzen optional "pending".
+      if (!fetchedOk) {
+        console.log(`Skip analyze: activity not ready yet (athlete=${ownerId}, activity=${activityId})`);
+        // Optional: Status auf "received" lassen oder "pending" setzen:
+        await pool.query(
+          `update workouts_raw
+           set status='received', updated_at=now()
+           where provider='strava' and activity_id=$1`,
+          [activityId]
+        );
+        return;
+      }
+
       await analyzeAndPushToBase44(ownerId, activityId);
     } catch (e) {
       console.error("Processing pipeline error:", e);
@@ -470,10 +487,6 @@ app.post("/webhooks/strava", async (req, res) => {
         [String(e?.message ?? e), activityId]
       );
     }
-  } catch (e) {
-    console.error("Webhook processing error:", e);
-  }
-});
 
 app.get("/webhooks/strava/test", async (req, res) => {
   const fake = {
